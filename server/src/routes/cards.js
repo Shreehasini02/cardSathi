@@ -1,0 +1,10 @@
+import { Router } from 'express';
+import { z } from 'zod';
+import { prisma } from '../shared.js';
+const router = Router();
+const cardInput = z.object({ name: z.string().trim().min(2).max(60), last4: z.string().regex(/^\d{4}$/), creditLimit: z.coerce.number().positive().max(100000000), network: z.string().max(20).optional(), billingDay: z.coerce.number().int().min(1).max(31).optional(), dueDay: z.coerce.number().int().min(1).max(31).optional() });
+router.get('/', async (req, res, next) => { try { const cards = await prisma.creditCard.findMany({ where: { userId: req.user.sub }, include: { transactions: { select: { amount: true } } }, orderBy: { createdAt: 'asc' } }); res.json({ cards }); } catch (e) { next(e); } });
+router.post('/', async (req, res, next) => { try { const input = cardInput.parse(req.body); const card = await prisma.creditCard.create({ data: { ...input, userId: req.user.sub } }); res.status(201).json({ card }); } catch (e) { next(e); } });
+router.patch('/:id', async (req, res, next) => { try { const input = cardInput.partial().parse(req.body); const owned = await prisma.creditCard.findFirst({ where: { id: req.params.id, userId: req.user.sub } }); if (!owned) return res.status(404).json({ error: 'Card not found.' }); res.json({ card: await prisma.creditCard.update({ where: { id: owned.id }, data: input }) }); } catch (e) { next(e); } });
+router.delete('/:id', async (req, res, next) => { try { const result = await prisma.creditCard.deleteMany({ where: { id: req.params.id, userId: req.user.sub } }); if (!result.count) return res.status(404).json({ error: 'Card not found.' }); res.status(204).end(); } catch (e) { next(e); } });
+export default router;

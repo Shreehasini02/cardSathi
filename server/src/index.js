@@ -1,0 +1,43 @@
+import 'dotenv/config';
+import express from 'express';
+import http from 'node:http';
+import cors from 'cors';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
+import { Server } from 'socket.io';
+import cron from 'node-cron';
+import jwt from 'jsonwebtoken';
+import { z } from 'zod';
+import { auth, adminOnly } from './middleware/auth.js';
+import { prisma } from './shared.js';
+import authRoutes from './routes/auth.js';
+import cardRoutes from './routes/cards.js';
+import transactionRoutes from './routes/transactions.js';
+import paymentRoutes from './routes/payments.js';
+import insightRoutes from './routes/insights.js';
+import adminRoutes from './routes/admin.js';
+
+const required = ['DATABASE_URL', 'JWT_SECRET'];
+if (required.some(key => !process.env[key])) { console.error(`Missing required environment variables: ${required.filter(key => !process.env[key]).join(', ')}`); process.exit(1); }
+const app = express(); const server = http.createServer(app); const io = new Server(server, { cors: { origin: process.env.CLIENT_ORIGIN || 'http://localhost:5173' } });
+app.use(helmet()); app.use(cors({ origin: process.env.CLIENT_ORIGIN || 'http://localhost:5173', credentials: true })); app.use(express.json({ limit: '1mb' })); app.use('/api', rateLimit({ windowMs: 15 * 60 * 1000, limit: 300, standardHeaders: true, legacyHeaders: false }));
+app.get('/api/health', (_req,res) => res.json({ status: 'ok', service: 'CardSaathi API' }));
+app.use('/api/auth', authRoutes);
+app.use('/api', auth);
+app.get('/api/me', async (req,res,next) => { try { const user = await prisma.user.findUnique({ where: { id: req.user.sub }, select: { id: true, name: true, email: true, role: true, language: true, dashboardMode: true } }); if (!user) return res.status(401).json({ error: 'Account not found.' }); res.json({ user }); } catch(e) { next(e); } });
+app.patch('/api/me/preferences', async (req,res,next) => { try { const data = z.object({ language: z.enum(['en','hi','te','gu']).optional(), dashboardMode: z.enum(['simple','advanced']).optional() }).parse(req.body); const user = await prisma.user.update({ where: { id: req.user.sub }, data, select: { id:true,name:true,email:true,role:true,language:true,dashboardMode:true } }); res.json({ user }); } catch(e) { next(e); } });
+app.use('/api/cards', cardRoutes); app.use('/api/transactions', transactionRoutes); app.use('/api/payments', paymentRoutes); app.use('/api/insights', insightRoutes); app.use('/api/admin', adminOnly, adminRoutes);
+app.post('/api/assistant', async (req,res,next) => { try { const { question } = z.object({ question: z.string().min(1).max(500) }).parse(req.body); const now = new Date(); const from = new Date(now.getFullYear(), now.getMonth(), 1); const [transactions, payment] = await Promise.all([prisma.transaction.findMany({ where: { userId: req.user.sub, date: { gte: from } }, include: { category: true }, orderBy: { date: 'desc' } }), prisma.payment.findFirst({ where: { userId: req.user.sub, status: { in: ['UPCOMING','OVERDUE'] } }, include: { card: true }, orderBy: { dueDate: 'asc' } })]); const q = question.toLowerCase(); let answer; if (q.includes('spend')) answer = `Your recorded spending this month is ₹${transactions.reduce((n,t)=>n+Number(t.amount),0).toLocaleString('en-IN')}.`; else if (q.includes('where') || q.includes('most')) { const totals = transactions.reduce((m,t) => (m[t.category.name] = (m[t.category.name]||0)+Number(t.amount),m), {}); const top = Object.entries(totals).sort((a,b)=>b[1]-a[1])[0]; answer = top ? `Most of your recorded spending went to ${top[0]}: ₹${top[1].toLocaleString('en-IN')}.` : 'There are no transactions recorded this month yet.'; } else if (q.includes('due') || q.includes('next payment')) answer = payment ? `Your next recorded payment is ₹${Number(payment.amount).toLocaleString('en-IN')} for ${payment.card.name}, due ${payment.dueDate.toLocaleDateString('en-IN')}.` : 'There is no upcoming payment in your saved records.'; else if (q.includes('minimum')) answer = 'Minimum due is the smallest amount you must pay by the due date to avoid a late payment fee in many cases. Unpaid balances may still attract interest. Paying the full amount due is generally better.'; else if (q.includes('util') || q.includes('limit')) answer = 'Credit utilisation is the portion of your card limit currently in use. Lower utilisation leaves more room for unexpected expenses.'; else answer = 'I can explain your monthly spending, top category, upcoming payment, minimum due, or credit utilisation.'; res.json({ answer, basedOnAccountData: q.includes('spend') || q.includes('where') || q.includes('most') || q.includes('due') }); } catch(e) { next(e); } });
+app.use((err, _req, res, _next) => {
+  if (err instanceof z.ZodError) return res.status(400).json({ error: err.issues.map(i => i.message).join(' ') });
+  console.error(err);
+  if (err?.name === 'PrismaClientInitializationError') return res.status(503).json({ error: 'Cannot connect to PostgreSQL. Check that the database is running and DATABASE_URL in server/.env is correct.' });
+  if (err?.code === 'P2021' || err?.code === 'P2022') return res.status(503).json({ error: 'The database schema is missing or out of date. Run the Prisma migration command from README.md.' });
+  if (err?.code === 'P2002') return res.status(409).json({ error: 'An account with this email already exists.' });
+  res.status(500).json({ error: 'An unexpected error occurred.' });
+});
+io.use((socket, next) => { try { const token = socket.handshake.auth?.token; if (!token) return next(new Error('Authentication required')); socket.data.user = jwt.verify(token, process.env.JWT_SECRET, { issuer: 'cardsaathi' }); next(); } catch { next(new Error('Invalid session')); } });
+io.on('connection', socket => { socket.join(`user:${socket.data.user.sub}`); });
+cron.schedule('0 9 * * *', async () => { try { const today = new Date(); const tomorrow = new Date(today.getTime() + 86400000); const due = await prisma.payment.findMany({ where: { status: 'UPCOMING', dueDate: { gte: today, lt: tomorrow } }, select: { id: true, userId: true, card: { select: { name: true } } } }); for (const item of due) { const notification = await prisma.notification.create({ data: { userId: item.userId, type: 'PAYMENT', title: 'Payment due today', body: `Your ${item.card.name} payment is due today.` } }); io.to(`user:${item.userId}`).emit('notification', notification); } await prisma.payment.updateMany({ where: { status: 'UPCOMING', dueDate: { lt: today } }, data: { status: 'OVERDUE' } }); } catch (error) { console.error('Payment reminder job failed', error); } }, { timezone: 'Asia/Kolkata' });
+const port = Number(process.env.PORT || 4000); server.listen(port, () => console.log(`CardSaathi API listening on ${port}`));
+process.on('SIGINT', async () => { await prisma.$disconnect(); server.close(() => process.exit(0)); });
